@@ -13,6 +13,7 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <vector>
 #include <unistd.h>
 
 namespace sn {
@@ -250,7 +251,10 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
     void remote(const std::shared_ptr<Controller>& c,const char* method,json::array arguments,std::function<void(bool,json::value)> done){
         if(closed||!c->subscribed){if(done)done(false,{});return;}
         if(pending.size()>=128){server.error("Too many pending web callbacks");close();return;}
-        auto call=identifier();pending.emplace(call,Pending{now()+2000000000,std::move(done)});
+        // Only calls with a callback are tracked. 3DxWare does not wait for
+        // replies to self:update, and clients such as driftlock.online answer
+        // none of them (or answer "transaction" with an error).
+        auto call=identifier();if(done)pending.emplace(call,Pending{now()+2000000000,std::move(done)});
         json::array payload{2,call,method,""};for(auto& arg:arguments)payload.push_back(std::move(arg));
         send(json::array{8,controllerURI+c->id,std::move(payload)});
     }
@@ -272,7 +276,11 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
         }
     }
     void tick(uint64_t time){
-        for(const auto& [key,call]:pending)if(time>call.deadline){server.error("Web callback timed out");close();return;}
+        std::vector<std::function<void(bool,json::value)>> expired;
+        for(auto it=pending.begin();it!=pending.end();)if(time>it->second.deadline){expired.push_back(std::move(it->second.done));it=pending.erase(it);}else ++it;
+        if(!expired.empty())server.error("Web callback timed out");
+        for(auto& done:expired)if(done)done(false,{});
+        if(closed)return;
         for(auto& [key,c]:controllers){
             if(!c->focus||!c->subscribed||server.focused!=key){if(c->moving||c->busy)stop(c);continue;}
             if(c->lastInput&&time-c->lastInput>250000000){stop(c,false);continue;}
@@ -325,7 +333,7 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
         remote(c,"self:update",json::array{"view.affine",std::move(matrix)},{});
         if(!perspective&&hasExtents)remote(c,"self:update",json::array{"view.extents",extents},{});
         std::weak_ptr<Session> weak=shared_from_this();auto generation=c->generation;
-        remote(c,"self:update",json::array{"transaction",0},[weak,c,generation](bool ok,json::value){if(auto self=weak.lock();self&&c->generation==generation){c->busy=false;if(!ok)self->stop(c);}});
+        remote(c,"self:update",json::array{"transaction",0},[weak,c,generation](bool,json::value){if(auto self=weak.lock();self&&c->generation==generation)c->busy=false;});
         if(!c->lastInput)stop(c);
     }
 };
