@@ -112,7 +112,7 @@ void unansweredUpdates(sn::WebServer& server,unsigned port,const std::string& di
             client.send(json::array{3,call[1],value});return;
         }
         CHECK(call[2]=="self:update");
-        if(property=="view.affine"){rowMajor=call[5].as_array();++matrices;CHECK(rowMajor[12]==0&&rowMajor[13]==0&&rowMajor[14]==0&&rowMajor[15]==1);}
+        if(property=="view.affine"){rowMajor=call[5].as_array();++matrices;auto n=[&](int i){return rowMajor[i].to_number<double>();};CHECK(n(12)==0&&n(13)==0&&n(14)==0&&n(15)==1);}
         else if(property=="motion"){if(!call[5].as_bool())++motionOff;}
         else if(property=="transaction")client.send(json::array{4,call[1],"self:update#generic","transaction unknown property"});
     };

@@ -341,7 +341,7 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
             view.advance(c->input.axes,dt,scale);camera=view.camera;
             if(hasExtents)for(int i=0;i<6;++i)extents.as_array()[i]=view.extents[i];
         }
-        double next[16]{camera.right.x,camera.right.y,camera.right.z,0,camera.up.x,camera.up.y,camera.up.z,0,camera.back.x,camera.back.y,camera.back.z,0,camera.position.x,camera.position.y,camera.position.z,1};
+        json::value next[16]{camera.right.x,camera.right.y,camera.right.z,0,camera.up.x,camera.up.y,camera.up.z,0,camera.back.x,camera.back.y,camera.back.z,0,camera.position.x,camera.position.y,camera.position.z,1};
         json::array matrix;for(int i=0;i<16;++i)matrix.push_back(next[c->rowMajor?(i%4)*4+i/4:i]);
         if(!numbers(matrix,16)){stop(c);return;}
         if(!c->moving){c->moving=true;remote(c,"self:update",json::array{"motion",true},{});}
