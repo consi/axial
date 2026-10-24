@@ -94,7 +94,7 @@ void unansweredUpdates(sn::WebServer& server,unsigned port,const std::string& di
     client.send(json::array{1,"3dconnexion","wss://127.51.68.120/3dconnexion"});
     client.send(json::array{1,"self","https://driftlock.online/"});
     auto mouse=client.call({2,"mouse","3dx_rpc:create","3dconnexion:3dmouse","0.7.0"}).as_object()["connexion"];
-    auto controller=client.call({2,"controller","3dx_rpc:create","3dconnexion:3dcontroller",mouse,json::object{{"name","DRIFT//LOCK"},{"version",0.7},{"rowMajorOrder",false}}}).as_object()["instance"];
+    auto controller=client.call({2,"controller","3dx_rpc:create","3dconnexion:3dcontroller",mouse,json::object{{"version",0},{"name","DRIFT//LOCK"}}}).as_object()["instance"];
     auto target="3dconnexion:3dcontroller/"+text(controller);
     client.send(json::array{5,target});
     client.call({2,"focus","3dx_rpc:update",target,json::object{{"focus",true}}});
