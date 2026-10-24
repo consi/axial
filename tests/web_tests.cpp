@@ -85,8 +85,9 @@ void onshapeInitialization(sn::WebServer& server,unsigned port,const std::string
 }
 
 // driftlock.online replays: the page answers reads, but ignores self:update for
-// view.affine and motion, and rejects "transaction" as an unknown property.
-// 3DxWare keeps navigating; Axial must not time the session out or stop motion.
+// view.affine and motion, and rejects "transaction" as an unknown property. Its
+// matrices are row-major without declaring rowMajorOrder. 3DxWare keeps
+// navigating; Axial must not time the session out, stop motion or mix layouts.
 void unansweredUpdates(sn::WebServer& server,unsigned port,const std::string& directory){
     Client client(port,directory+"/root.crt");client.connect();
     client.send(json::array{1,"3dx_rpc","wss://127.51.68.120/3dconnexion#"});
@@ -97,13 +98,13 @@ void unansweredUpdates(sn::WebServer& server,unsigned port,const std::string& di
     auto target="3dconnexion:3dcontroller/"+text(controller);
     client.send(json::array{5,target});
     client.call({2,"focus","3dx_rpc:update",target,json::object{{"focus",true}}});
-    int matrices=0,motionOff=0;
+    int matrices=0,motionOff=0;json::array rowMajor{1,0,0,0,0,1,0,0,0,0,1,10,0,0,0,1};
     auto driftlock=[&](const json::array& event){
         CHECK(event[0]==8);const auto& call=event[2].as_array();CHECK(call[0]==2);
         auto property=text(call[4]);
         if(call[2]=="self:read"){
             json::value value;
-            if(property=="view.affine")value=client.matrix;
+            if(property=="view.affine")value=rowMajor;
             else if(property=="view.perspective"||property=="view.rotatable")value=true;
             else if(property=="view.extents"||property=="model.extents")value=json::array{-1,-1,-1,1,1,1};
             else if(property=="pivot.position")value=json::array{0,0,0};
@@ -111,7 +112,7 @@ void unansweredUpdates(sn::WebServer& server,unsigned port,const std::string& di
             client.send(json::array{3,call[1],value});return;
         }
         CHECK(call[2]=="self:update");
-        if(property=="view.affine"){client.matrix=call[5].as_array();++matrices;}
+        if(property=="view.affine"){rowMajor=call[5].as_array();++matrices;CHECK(rowMajor[12]==0&&rowMajor[13]==0&&rowMajor[14]==0&&rowMajor[15]==1);}
         else if(property=="motion"){if(!call[5].as_bool())++motionOff;}
         else if(property=="transaction")client.send(json::array{4,call[1],"self:update#generic","transaction unknown property"});
     };
@@ -126,7 +127,7 @@ void unansweredUpdates(sn::WebServer& server,unsigned port,const std::string& di
     }
     // Navigation survived the two-second callback deadline.
     CHECK(early>10);CHECK(matrices>early);
-    CHECK(client.matrix[12].to_number<double>()>0);
+    CHECK(rowMajor[3].to_number<double>()>0);
     auto error=text(json::parse(server.status()).as_object()["error"]);
     CHECK(!error.starts_with("Web callback timed out")&&!error.starts_with("Client did not supply"));
     e.axes={};server.receive(e);while(!motionOff)driftlock(client.read());

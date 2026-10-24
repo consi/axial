@@ -8,6 +8,7 @@
 #include <boost/beast/ssl.hpp>
 #include <boost/json/src.hpp>
 #include <atomic>
+#include <cmath>
 #include <deque>
 #include <functional>
 #include <map>
@@ -80,6 +81,8 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
     struct Controller {
         std::string id,name;
         bool subscribed=false,focus=false,moving=false,busy=false,fit=false;
+        // Matrix layout: rowMajorOrder from create, otherwise detected per frame.
+        bool rowMajor=false,layoutFixed=false;
         uint64_t lastInput=0,lastFrame=0,generation=0;
         Event input;
         json::object properties;
@@ -220,7 +223,9 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
             if(a.size()==5&&a[3]=="3dconnexion:3dmouse"&&mouse.empty()){mouse="mouse"+identifier();result(call,json::object{{"connexion",mouse}});return;}
             if(a.size()==6&&a[3]=="3dconnexion:3dcontroller"&&!mouse.empty()&&string(a[4])==mouse&&a[5].is_object()&&controllers.size()<16){
                 auto name=string(member(a[5].as_object(),"name"));if(name.size()>1024){failure(call,"Controller name too long");return;}
-                auto c=std::make_shared<Controller>();c->id="controller"+identifier();c->name=std::move(name);controllers[c->id]=c;result(call,json::object{{"instance",c->id}});return;
+                auto c=std::make_shared<Controller>();c->id="controller"+identifier();c->name=std::move(name);
+                if(auto order=a[5].as_object().if_contains("rowMajorOrder");order&&order->is_bool()){c->rowMajor=order->as_bool();c->layoutFixed=true;}
+                controllers[c->id]=c;result(call,json::object{{"instance",c->id}});return;
             }
         }else if(method==std::string(rpcURI)+"update"&&a.size()==5&&a[4].is_object()){
             auto it=findController(a[3]);if(it==controllers.end()){failure(call,"Unknown controller");return;}auto c=it->second;
@@ -305,7 +310,17 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
         if(!c->focus||server.focused!=c->id){stop(c);return;}
         auto affine=member(values,"view.affine"),extents=member(values,"view.extents"),bounds=member(values,"model.extents");
         if(!numbers(affine,16)){c->busy=false;stop(c);server.error("Client did not supply view.affine");return;}
-        const auto& m=affine.as_array();Camera camera{{number(m[0]),number(m[1]),number(m[2])},{number(m[4]),number(m[5]),number(m[6])},{number(m[8]),number(m[9]),number(m[10])},{number(m[12]),number(m[13]),number(m[14])}};
+        const auto& m=affine.as_array();
+        if(!c->layoutFixed){
+            // Clients such as driftlock.online send row-major matrices without
+            // declaring it; 3DxWare accepts them. The homogeneous row (0,0,0,1)
+            // reveals the layout whenever the translation is non-zero.
+            auto zero=[&](int i){return std::abs(number(m[i]))<1e-9;};
+            bool column=zero(3)&&zero(7)&&zero(11),row=zero(12)&&zero(13)&&zero(14);
+            if(column!=row)c->rowMajor=row;
+        }
+        auto at=[&](int i){return number(m[c->rowMajor?(i%4)*4+i/4:i]);};
+        Camera camera{{at(0),at(1),at(2)},{at(4),at(5),at(6)},{at(8),at(9),at(10)},{at(12),at(13),at(14)}};
         auto position=member(values,"pivot.position");if(!numbers(position,3))position=member(values,"view.target");
         Vec pivot{};if(numbers(position,3))pivot={number(position.as_array()[0]),number(position.as_array()[1]),number(position.as_array()[2])};
         else if(numbers(bounds,6)){const auto& b=bounds.as_array();pivot={(number(b[0])+number(b[3]))/2,(number(b[1])+number(b[4]))/2,(number(b[2])+number(b[5]))/2};}
@@ -326,7 +341,8 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
             view.advance(c->input.axes,dt,scale);camera=view.camera;
             if(hasExtents)for(int i=0;i<6;++i)extents.as_array()[i]=view.extents[i];
         }
-        json::array matrix{camera.right.x,camera.right.y,camera.right.z,0,camera.up.x,camera.up.y,camera.up.z,0,camera.back.x,camera.back.y,camera.back.z,0,camera.position.x,camera.position.y,camera.position.z,1};
+        double next[16]{camera.right.x,camera.right.y,camera.right.z,0,camera.up.x,camera.up.y,camera.up.z,0,camera.back.x,camera.back.y,camera.back.z,0,camera.position.x,camera.position.y,camera.position.z,1};
+        json::array matrix;for(int i=0;i<16;++i)matrix.push_back(next[c->rowMajor?(i%4)*4+i/4:i]);
         if(!numbers(matrix,16)){stop(c);return;}
         if(!c->moving){c->moving=true;remote(c,"self:update",json::array{"motion",true},{});}
         remote(c,"self:update",json::array{"transaction",1},{});
