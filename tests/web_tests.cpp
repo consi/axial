@@ -84,6 +84,57 @@ void onshapeInitialization(sn::WebServer& server,unsigned port,const std::string
     CHECK(fresh.call({2,"fresh-mouse","rpc:create","3dconnexion:3dmouse","0.6.0"}).as_object().contains("connexion"));
 }
 
+// driftlock.online replays: the page answers reads, but ignores self:update for
+// view.affine and motion, and rejects "transaction" as an unknown property. Its
+// matrices are row-major without declaring rowMajorOrder. 3DxWare keeps
+// navigating; Axial must not time the session out, stop motion or mix layouts.
+void unansweredUpdates(sn::WebServer& server,unsigned port,const std::string& directory){
+    Client client(port,directory+"/root.crt");client.connect();
+    client.send(json::array{1,"3dx_rpc","wss://127.51.68.120/3dconnexion#"});
+    client.send(json::array{1,"3dconnexion","wss://127.51.68.120/3dconnexion"});
+    client.send(json::array{1,"self","https://driftlock.online/"});
+    auto mouse=client.call({2,"mouse","3dx_rpc:create","3dconnexion:3dmouse","0.7.0"}).as_object()["connexion"];
+    auto controller=client.call({2,"controller","3dx_rpc:create","3dconnexion:3dcontroller",mouse,json::object{{"version",0},{"name","DRIFT//LOCK"}}}).as_object()["instance"];
+    auto target="3dconnexion:3dcontroller/"+text(controller);
+    client.send(json::array{5,target});
+    client.call({2,"focus","3dx_rpc:update",target,json::object{{"focus",true}}});
+    int matrices=0,motionOff=0;json::array rowMajor{1,0,0,0,0,1,0,0,0,0,1,10,0,0,0,1};
+    auto driftlock=[&](const json::array& event){
+        CHECK(event[0]==8);const auto& call=event[2].as_array();CHECK(call[0]==2);
+        auto property=text(call[4]);
+        if(call[2]=="self:read"){
+            json::value value;
+            if(property=="view.affine")value=rowMajor;
+            else if(property=="view.perspective"||property=="view.rotatable")value=true;
+            else if(property=="view.extents"||property=="model.extents")value=json::array{-1,-1,-1,1,1,1};
+            else if(property=="pivot.position")value=json::array{0,0,0};
+            else {client.send(json::array{4,call[1],"self:read#generic","unknown property"});return;}
+            client.send(json::array{3,call[1],value});return;
+        }
+        CHECK(call[2]=="self:update");
+        if(property=="view.affine"){rowMajor=call[5].as_array();++matrices;auto n=[&](int i){return rowMajor[i].to_number<double>();};CHECK(n(12)==0&&n(13)==0&&n(14)==0&&n(15)==1);}
+        else if(property=="motion"){if(!call[5].as_bool())++motionOff;}
+        else if(property=="transaction")client.send(json::array{4,call[1],"self:update#generic","transaction unknown property"});
+    };
+    sn::Event e;e.device=1;e.vendor=0x046d;e.product=0xc629;e.kind=sn::Kind::motion;e.axes[0]=350;e.flags=sn::Flags::orbit;server.receive(e);
+    auto started=std::chrono::steady_clock::now(),sent=started;int early=0;
+    while(std::chrono::steady_clock::now()-started<std::chrono::milliseconds(2600)){
+        driftlock(client.read());
+        auto now=std::chrono::steady_clock::now();
+        // The cap keeps reporting while held; idle input stops motion after 250 ms.
+        if(now-sent>std::chrono::milliseconds(100)){server.receive(e);sent=now;}
+        if(now-started<std::chrono::milliseconds(2100))early=matrices;
+    }
+    // Navigation survived the two-second callback deadline.
+    CHECK(early>10);CHECK(matrices>early);
+    CHECK(rowMajor[3].to_number<double>()>0);
+    auto error=text(json::parse(server.status()).as_object()["error"]);
+    CHECK(!error.starts_with("Web callback timed out")&&!error.starts_with("Client did not supply"));
+    e.axes={};server.receive(e);while(!motionOff)driftlock(client.read());
+    CHECK(client.call({2,"alive","rpc:read",target,"focus"})==true);
+    client.call({2,"blur","rpc:update",target,json::object{{"focus",false}}});
+}
+
 int main(int argc,char** argv){try{
     CHECK(argc==2);std::string directory=argv[1];
     sn::WebServer server("127.0.0.1",0);sn::WebConfiguration config;
@@ -143,6 +194,7 @@ int main(int argc,char** argv){try{
         CHECK(second!=controller);client.call({2,"delete","rpc:delete",prefix+text(second)});
         client.unknownController(text(second));
     }
+    unansweredUpdates(server,port,directory);
     onshapeInitialization(server,port,directory);
     sn::WebServer conflict("127.0.0.1",port);conflict.configure(config);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));CHECK(json::parse(conflict.status()).as_object()["listening"]==false);
@@ -160,6 +212,6 @@ int main(int argc,char** argv){try{
     bool closed=false;try{connected.read();}catch(const boost::system::system_error&){closed=true;}CHECK(closed);
     net::io_context probeIO;tcp::socket probe(probeIO);boost::system::error_code connectError;
     probe.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"),lifetimePort),connectError);CHECK(bool(connectError));
-    std::cout<<"TLS, discovery, origins, WAMP lifecycle, Onshape initialization, size limits, camera callbacks, neutral, focus and port conflict passed\n";
+    std::cout<<"TLS, discovery, origins, WAMP lifecycle, unanswered updates, Onshape initialization, size limits, camera callbacks, neutral, focus and port conflict passed\n";
     return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<"\n";return 1;}}

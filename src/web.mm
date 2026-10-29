@@ -8,11 +8,13 @@
 #include <boost/beast/ssl.hpp>
 #include <boost/json/src.hpp>
 #include <atomic>
+#include <cmath>
 #include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <thread>
+#include <vector>
 #include <unistd.h>
 
 namespace sn {
@@ -79,6 +81,8 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
     struct Controller {
         std::string id,name;
         bool subscribed=false,focus=false,moving=false,busy=false,fit=false;
+        // Matrix layout: rowMajorOrder from create, otherwise detected per frame.
+        bool rowMajor=false,layoutFixed=false;
         uint64_t lastInput=0,lastFrame=0,generation=0;
         Event input;
         json::object properties;
@@ -219,7 +223,9 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
             if(a.size()==5&&a[3]=="3dconnexion:3dmouse"&&mouse.empty()){mouse="mouse"+identifier();result(call,json::object{{"connexion",mouse}});return;}
             if(a.size()==6&&a[3]=="3dconnexion:3dcontroller"&&!mouse.empty()&&string(a[4])==mouse&&a[5].is_object()&&controllers.size()<16){
                 auto name=string(member(a[5].as_object(),"name"));if(name.size()>1024){failure(call,"Controller name too long");return;}
-                auto c=std::make_shared<Controller>();c->id="controller"+identifier();c->name=std::move(name);controllers[c->id]=c;result(call,json::object{{"instance",c->id}});return;
+                auto c=std::make_shared<Controller>();c->id="controller"+identifier();c->name=std::move(name);
+                if(auto order=a[5].as_object().if_contains("rowMajorOrder");order&&order->is_bool()){c->rowMajor=order->as_bool();c->layoutFixed=true;}
+                controllers[c->id]=c;result(call,json::object{{"instance",c->id}});return;
             }
         }else if(method==std::string(rpcURI)+"update"&&a.size()==5&&a[4].is_object()){
             auto it=findController(a[3]);if(it==controllers.end()){failure(call,"Unknown controller");return;}auto c=it->second;
@@ -250,7 +256,10 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
     void remote(const std::shared_ptr<Controller>& c,const char* method,json::array arguments,std::function<void(bool,json::value)> done){
         if(closed||!c->subscribed){if(done)done(false,{});return;}
         if(pending.size()>=128){server.error("Too many pending web callbacks");close();return;}
-        auto call=identifier();pending.emplace(call,Pending{now()+2000000000,std::move(done)});
+        // Only calls with a callback are tracked. 3DxWare does not wait for
+        // replies to self:update, and clients such as driftlock.online answer
+        // none of them (or answer "transaction" with an error).
+        auto call=identifier();if(done)pending.emplace(call,Pending{now()+2000000000,std::move(done)});
         json::array payload{2,call,method,""};for(auto& arg:arguments)payload.push_back(std::move(arg));
         send(json::array{8,controllerURI+c->id,std::move(payload)});
     }
@@ -272,7 +281,11 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
         }
     }
     void tick(uint64_t time){
-        for(const auto& [key,call]:pending)if(time>call.deadline){server.error("Web callback timed out");close();return;}
+        std::vector<std::function<void(bool,json::value)>> expired;
+        for(auto it=pending.begin();it!=pending.end();)if(time>it->second.deadline){expired.push_back(std::move(it->second.done));it=pending.erase(it);}else ++it;
+        if(!expired.empty())server.error("Web callback timed out");
+        for(auto& done:expired)if(done)done(false,{});
+        if(closed)return;
         for(auto& [key,c]:controllers){
             if(!c->focus||!c->subscribed||server.focused!=key){if(c->moving||c->busy)stop(c);continue;}
             if(c->lastInput&&time-c->lastInput>250000000){stop(c,false);continue;}
@@ -297,7 +310,17 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
         if(!c->focus||server.focused!=c->id){stop(c);return;}
         auto affine=member(values,"view.affine"),extents=member(values,"view.extents"),bounds=member(values,"model.extents");
         if(!numbers(affine,16)){c->busy=false;stop(c);server.error("Client did not supply view.affine");return;}
-        const auto& m=affine.as_array();Camera camera{{number(m[0]),number(m[1]),number(m[2])},{number(m[4]),number(m[5]),number(m[6])},{number(m[8]),number(m[9]),number(m[10])},{number(m[12]),number(m[13]),number(m[14])}};
+        const auto& m=affine.as_array();
+        if(!c->layoutFixed){
+            // Clients such as driftlock.online send row-major matrices without
+            // declaring it; 3DxWare accepts them. The homogeneous row (0,0,0,1)
+            // reveals the layout whenever the translation is non-zero.
+            auto zero=[&](int i){return std::abs(number(m[i]))<1e-9;};
+            bool column=zero(3)&&zero(7)&&zero(11),row=zero(12)&&zero(13)&&zero(14);
+            if(column!=row)c->rowMajor=row;
+        }
+        auto at=[&](int i){return number(m[c->rowMajor?(i%4)*4+i/4:i]);};
+        Camera camera{{at(0),at(1),at(2)},{at(4),at(5),at(6)},{at(8),at(9),at(10)},{at(12),at(13),at(14)}};
         auto position=member(values,"pivot.position");if(!numbers(position,3))position=member(values,"view.target");
         Vec pivot{};if(numbers(position,3))pivot={number(position.as_array()[0]),number(position.as_array()[1]),number(position.as_array()[2])};
         else if(numbers(bounds,6)){const auto& b=bounds.as_array();pivot={(number(b[0])+number(b[3]))/2,(number(b[1])+number(b[4]))/2,(number(b[2])+number(b[5]))/2};}
@@ -318,14 +341,15 @@ struct WebServer::Impl::Session:std::enable_shared_from_this<Session> {
             view.advance(c->input.axes,dt,scale);camera=view.camera;
             if(hasExtents)for(int i=0;i<6;++i)extents.as_array()[i]=view.extents[i];
         }
-        json::array matrix{camera.right.x,camera.right.y,camera.right.z,0,camera.up.x,camera.up.y,camera.up.z,0,camera.back.x,camera.back.y,camera.back.z,0,camera.position.x,camera.position.y,camera.position.z,1};
+        json::value next[16]{camera.right.x,camera.right.y,camera.right.z,0,camera.up.x,camera.up.y,camera.up.z,0,camera.back.x,camera.back.y,camera.back.z,0,camera.position.x,camera.position.y,camera.position.z,1};
+        json::array matrix;for(int i=0;i<16;++i)matrix.push_back(next[c->rowMajor?(i%4)*4+i/4:i]);
         if(!numbers(matrix,16)){stop(c);return;}
         if(!c->moving){c->moving=true;remote(c,"self:update",json::array{"motion",true},{});}
         remote(c,"self:update",json::array{"transaction",1},{});
         remote(c,"self:update",json::array{"view.affine",std::move(matrix)},{});
         if(!perspective&&hasExtents)remote(c,"self:update",json::array{"view.extents",extents},{});
         std::weak_ptr<Session> weak=shared_from_this();auto generation=c->generation;
-        remote(c,"self:update",json::array{"transaction",0},[weak,c,generation](bool ok,json::value){if(auto self=weak.lock();self&&c->generation==generation){c->busy=false;if(!ok)self->stop(c);}});
+        remote(c,"self:update",json::array{"transaction",0},[weak,c,generation](bool,json::value){if(auto self=weak.lock();self&&c->generation==generation)c->busy=false;});
         if(!c->lastInput)stop(c);
     }
 };
