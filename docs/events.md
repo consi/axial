@@ -227,5 +227,9 @@ path from `os.getuid()`.
 The service's request API is a separate newline-delimited JSON protocol at
 `/tmp/axial-$UID/events.control` (or the `AXIAL_SOCKET` path with
 `.control` appended). The bundled `axialctl` command uses it for `status`,
-`config`, `commands`, and configuration updates. It is not part of the binary
-event record stream described here.
+`config`, `commands`, `calibrate`, and configuration updates. `{"op":"calibrate"}`
+rezeroes each device that has 3DxWare's calibration feature report (ID 7,
+usage `0xff00:0x22`, set to 0 while the LED blinks for about four seconds); add
+`"device":id` for one device. The response counts those devices in
+`calibrated`; status reports `rezero`, `calibrating` and `deviceCalibrated` per
+device. It is not part of the binary event record stream described here.

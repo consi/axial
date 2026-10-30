@@ -1,8 +1,8 @@
-## Changes in v0.2.4
+## Changes in v0.2.5
 
-- Supports the SpaceMouse Wireless through the 3Dconnexion Universal Receiver (`256f:c652`), including motion and both buttons.
-- Aligns movement in the built-in test scene with conventions used by other 3D applications.
-- Makes the preview integration test tolerate delayed events and waits for the mock service to answer before testing it.
+- Adds hardware zero calibration (#11): **Motion → Calibrate…** or `axialctl calibrate` rezeroes controllers that support it, as 3DxWare does, while the LED blinks for about four seconds.
+- Keeps web pages that do not answer `self:update`, such as driftlock.online, navigating instead of closing the session after two seconds (#12).
+- Honours `rowMajorOrder` in the web API and detects row-major `view.affine` matrices from clients that do not declare it.
 
 ## Installation
 

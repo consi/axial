@@ -257,6 +257,9 @@ int main(int argc,char** argv){try {@autoreleasepool {
         CHECK(sn::readAll(peer,&received,sizeof(received)));CHECK(received.kind==sn::Kind::added);::close(peer);
     }
     CHECK(sn::request("{\"op\":\"status\"}").find("\"mock\":true")!=std::string::npos);
+    // Virtual devices have no calibration feature report to rezero.
+    CHECK(sn::request("{\"op\":\"calibrate\"}")=="{\"calibrated\":0}");
+    for(const char* invalid:{R"({"op":"calibrate","device":0})",R"({"op":"calibrate","device":1.5})",R"({"op":"calibrate","device":"1"})"})CHECK(sn::request(invalid).find("error")!=std::string::npos);
     // The native test tab receives full event edges, independently of its UI
     // refresh. Short press/release pairs must both reach the session log.
     AxialPreviewStart();

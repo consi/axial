@@ -16,10 +16,11 @@ int main(int argc,char** argv) {
     else if(command=="stop")request="{\"op\":\"stop\"}";
     else if(command=="config")request="{\"op\":\"getConfig\"}";
     else if(command=="commands")request="{\"op\":\"getCommands\"}";
+    else if(command=="calibrate")request="{\"op\":\"calibrate\"}";
     else if(command=="set-config"){
         std::string data((std::istreambuf_iterator<char>(std::cin)),{});
         request="{\"op\":\"setConfig\",\"config\":"+data+"}";
-    } else {fprintf(stderr,"usage: axialctl [status|stop|monitor|config|commands|set-config < settings.json]\n");return 2;}
+    } else {fprintf(stderr,"usage: axialctl [status|stop|monitor|config|commands|calibrate|set-config < settings.json]\n");return 2;}
     auto response=sn::request(request);std::cout<<response<<std::endl;
     // Service failures are top-level error objects. Status also contains a
     // nested web.error field, which must not turn a successful query into failure.

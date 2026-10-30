@@ -46,6 +46,8 @@ struct Device: Codable, Identifiable {
     var id: Int; var vendor: Int; var product: Int; var name: String
     var axes: [Int]; var buttons: UInt32
     var ledSupported: Bool?; var ledState: Int?; var ledError: UInt32?
+    // Hardware zero calibration: supported, running now, done since connecting.
+    var rezero: Bool?; var calibrating: Bool?; var deviceCalibrated: Bool?
     var layout: ControllerLayout? {DeviceCatalog.identity(vendor: vendor, product: product).flatMap {DeviceCatalog.layouts[$0]}}
     var displayName: String {layout?.name ?? name}
 }
@@ -324,6 +326,16 @@ struct AppCommand: Codable, Identifiable {var id: String; var label: String}
             if SMAppService.mainApp.status == .requiresApproval {SMAppService.openSystemSettingsLoginItems()}
         } catch {message = error.localizedDescription}
     }
+    // Rezeroes the selected controller in hardware while its LED blinks.
+    func calibrate() {
+        guard let device else {return}
+        let client = self.client
+        Task {
+            let data = await client.request("{\"op\":\"calibrate\",\"device\":\(device.id)}")
+            let response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            if response?["calibrated"] as? Int != 1 {message = "Could not calibrate \(device.displayName)."}
+        }
+    }
     func requestAccessibility() {
         let client = self.client
         Task {
@@ -390,6 +402,7 @@ struct KeyRecorder: NSViewRepresentable {
 }
 struct SettingsView: View {
     @EnvironmentObject var model: Model
+    @State private var confirmCalibration = false
     private let axes = ["Left / right", "Near / far", "Up / down", "Tilt", "Roll", "Spin"]
     var body: some View {
         HSplitView {
@@ -476,8 +489,20 @@ struct SettingsView: View {
                 }
             }
             }
-            Button("Reset this profile") {model.edit {$0 = Profile()}}
+            HStack(spacing: 12) {
+                Button("Reset this profile") {model.edit {$0 = Profile()}}
+                Button("Calibrate…") {confirmCalibration = true}
+                    .disabled(model.device?.rezero != true || model.device?.calibrating == true)
+                    .help(model.device?.rezero == true ? "Rezero the controller in hardware" : "This controller does not support hardware calibration")
+                Text(model.device?.calibrating == true ? "Calibrating, keep your hand off the cap…" : (model.device?.deviceCalibrated == true ? "Calibrated" : ""))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Spacer(minLength: 0)
+        }.alert("Calibrate \(model.device?.displayName ?? "controller")?", isPresented: $confirmCalibration) {
+            Button("Calibrate") {model.calibrate()}
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Let go of the cap and do not touch it until the LED stops blinking. The controller's current position becomes its rest position.")
         }
     }
     var buttons: some View {

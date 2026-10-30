@@ -7,6 +7,7 @@
 #include "axial/web.hpp"
 #include <atomic>
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <map>
 #include <thread>
@@ -50,6 +51,16 @@ struct LEDOutput {
     LEDOutput(IOHIDDeviceRef d,IOHIDElementRef e):device(d),element(e){CFRetain(d);CFRetain(e);}
     ~LEDOutput(){CFRelease(element);CFRelease(device);}
 };
+// Hardware zero calibration. 3DxWare rezeroes a device by setting vendor
+// feature report 7 (usage 0xff00:0x22) to 0 while it blinks the LED.
+struct RezeroOutput {
+    IOHIDDeviceRef device;
+    IOHIDElementRef element;
+    std::atomic<bool> connected{true},busy{false};
+    RezeroOutput(IOHIDDeviceRef d,IOHIDElementRef e):device(d),element(e){CFRetain(d);CFRetain(e);}
+    ~RezeroOutput(){CFRelease(element);CFRelease(device);}
+};
+constexpr uint32_t rezeroReport=7,rezeroPage=0xff00,rezeroUsage=0x22;
 struct HID {
     IOHIDDeviceRef device=nullptr;
     Decoder decoder;
@@ -58,6 +69,8 @@ struct HID {
     uint32_t suppressedButtons=0;
     std::shared_ptr<LEDOutput> led;
     int requestedLED=-1;
+    std::shared_ptr<RezeroOutput> rezero;
+    bool deviceCalibrated=false;
 };
 struct Snapshot {
     std::array<Event,16> latest{};
@@ -67,6 +80,7 @@ struct Snapshot {
     std::array<bool,16> ledSupported{};
     std::array<int,16> ledState{};
     std::array<uint32_t,16> ledError{};
+    std::array<bool,16> rezero{},calibrating{},deviceCalibrated{};
 };
 dispatch_queue_t inputQueue;
 std::array<Peer,32> peers;
@@ -96,16 +110,46 @@ NSMutableDictionary* commandCatalog;
 NSString* settingsPath;
 uint32_t nextDevice=1;
 
+// Runs on the output queue.
+IOReturn writeValue(IOHIDDeviceRef device,IOHIDElementRef element,CFIndex integer) {
+    auto value=IOHIDValueCreateWithIntegerValue(kCFAllocatorDefault,element,mach_absolute_time(),integer);
+    IOReturn result=value?IOHIDDeviceSetValue(device,element,value):kIOReturnNoMemory;
+    if(value)CFRelease(value);
+    return result;
+}
+void writeLED(LEDOutput& output,bool enabled) {
+    if(!output.connected.load())return;
+    IOReturn result=writeValue(output.device,output.element,enabled?1:0);
+    output.error=result;output.state=result==kIOReturnSuccess?int(enabled):-1;
+}
 void setLED(HID& hid,bool enabled) {
     if(!hid.led||hid.requestedLED==int(enabled))return;
     hid.requestedLED=enabled;auto output=hid.led;
-    dispatch_async(outputQueue,^{
-        if(!output->connected.load())return;
-        auto value=IOHIDValueCreateWithIntegerValue(kCFAllocatorDefault,output->element,mach_absolute_time(),enabled?1:0);
-        IOReturn result=value?IOHIDDeviceSetValue(output->device,output->element,value):kIOReturnNoMemory;
-        if(value)CFRelease(value);
-        output->error=result;output->state=result==kIOReturnSuccess?int(enabled):-1;
-    });
+    dispatch_async(outputQueue,^{writeLED(*output,enabled);});
+}
+// Hardware zero calibration, timed like 3DxWare: the LED blinks for about four
+// seconds and the device is rezeroed halfway through, once the cap has settled.
+void calibrate(HID& h) {
+    auto rezero=h.rezero;auto led=h.led;uint32_t device=h.decoder.state.device;
+    if(rezero->busy.exchange(true))return;
+    auto step=std::make_shared<std::function<void(int)>>();
+    *step=[rezero,led,device,step](int i){
+        bool connected=rezero->connected.load();
+        if(connected&&i==8){
+            bool ok=writeValue(rezero->device,rezero->element,0)==kIOReturnSuccess;
+            dispatch_async(inputQueue,^{for(auto& h:hidDevices)if(h.device&&h.decoder.state.device==device){h.deviceCalibrated=ok;break;}});
+        }
+        if(connected&&i<16){
+            if(led)writeLED(*led,i%2==0);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,265*NSEC_PER_MSEC),outputQueue,^{(*step)(i+1);});
+            return;
+        }
+        rezero->busy=false;
+        // Restore the profile's LED state; breaks the step's self-reference.
+        dispatch_async(inputQueue,^{for(auto& h:hidDevices)if(h.device&&h.decoder.state.device==device){h.requestedLED=-1;setLED(h,h.profile.led);break;}});
+        *step=nullptr;
+    };
+    dispatch_async(outputQueue,^{(*step)(0);});
 }
 
 void postKey(int key,bool down,uint64_t modifiers){
@@ -253,10 +297,12 @@ void added(void*,IOReturn result,void*,IOHIDDeviceRef d) {
     if(!deviceSpec(vid,pid)||!multiAxis(d))return;
     for(auto& h:hidDevices)if(!h.device) {
         h.device=d;CFRetain(d);h.decoder=Decoder{};h.previousButtons=0;h.suppressedButtons=0;
-        h.led.reset();h.requestedLED=-1;
+        h.led.reset();h.requestedLED=-1;h.rezero.reset();h.deviceCalibrated=false;
         NSArray* elements=CFBridgingRelease(IOHIDDeviceCopyMatchingElements(d,nullptr,kIOHIDOptionsTypeNone));
         for(id item in elements){auto element=(__bridge IOHIDElementRef)item;
-            if(IOHIDElementGetType(element)==kIOHIDElementTypeOutput&&IOHIDElementGetUsagePage(element)==8&&IOHIDElementGetUsage(element)==0x4b){h.led=std::make_shared<LEDOutput>(d,element);break;}
+            auto type=IOHIDElementGetType(element);auto page=IOHIDElementGetUsagePage(element),usage=IOHIDElementGetUsage(element);
+            if(!h.led&&type==kIOHIDElementTypeOutput&&page==8&&usage==0x4b)h.led=std::make_shared<LEDOutput>(d,element);
+            if(!h.rezero&&type==kIOHIDElementTypeFeature&&page==rezeroPage&&usage==rezeroUsage&&IOHIDElementGetReportID(element)==rezeroReport)h.rezero=std::make_shared<RezeroOutput>(d,element);
         }
         auto& e=h.decoder.state;e.device=nextDevice++;e.vendor=vid;e.product=pid;
         selectProfile();
@@ -264,7 +310,7 @@ void added(void*,IOReturn result,void*,IOHIDDeviceRef d) {
     }
 }
 void removed(void*,IOReturn,void*,IOHIDDeviceRef d) {
-    for(auto& h:hidDevices)if(h.device==d){Event e=h.decoder.state;e.axes={};e.buttons=0;e.kind=Kind::removed;e.received=now();route(e);if(h.led)h.led->connected=false;h.led.reset();CFRelease(h.device);h.device=nullptr;return;}
+    for(auto& h:hidDevices)if(h.device==d){Event e=h.decoder.state;e.axes={};e.buttons=0;e.kind=Kind::removed;e.received=now();route(e);if(h.led)h.led->connected=false;h.led.reset();if(h.rezero)h.rezero->connected=false;h.rezero.reset();CFRelease(h.device);h.device=nullptr;return;}
 }
 int listener(bool control) {
     auto path=socketPath(control);auto parent=path.substr(0,path.find_last_of('/'));
@@ -394,7 +440,8 @@ NSDictionary* status() {
     __block Snapshot snapshot;
     __block NSString* bundle;
     dispatch_sync(inputQueue,^{
-        for(const auto& h:hidDevices)if(h.device&&snapshot.count<16){size_t i=snapshot.count++;snapshot.latest[i]=h.decoder.state;snapshot.ledSupported[i]=bool(h.led);snapshot.ledState[i]=h.led?h.led->state.load():-1;snapshot.ledError[i]=h.led?h.led->error.load():0;}
+        for(const auto& h:hidDevices)if(h.device&&snapshot.count<16){size_t i=snapshot.count++;snapshot.latest[i]=h.decoder.state;snapshot.ledSupported[i]=bool(h.led);snapshot.ledState[i]=h.led?h.led->state.load():-1;snapshot.ledError[i]=h.led?h.led->error.load():0;
+            snapshot.rezero[i]=bool(h.rezero);snapshot.calibrating[i]=h.rezero&&h.rezero->busy.load();snapshot.deviceCalibrated[i]=h.deviceCalibrated;}
         for(const auto& e:virtualDevices)if(e.device&&snapshot.count<16)snapshot.latest[snapshot.count++]=e;
         for(const auto& p:peers)if(p.fd>=0&&p.registered)++snapshot.clients;
         snapshot.reports=reports;snapshot.overflows=overflows;snapshot.rejected=rejected;snapshot.foreground=foregroundPID;
@@ -403,7 +450,8 @@ NSDictionary* status() {
     NSMutableArray* items=[NSMutableArray array];
     for(size_t i=0;i<snapshot.count;++i){const auto& e=snapshot.latest[i];auto spec=deviceSpec(e.vendor,e.product);
         NSMutableArray* axes=[NSMutableArray array];for(int16_t x:e.axes)[axes addObject:@(x)];
-        [items addObject:@{@"id":@(e.device),@"vendor":@(e.vendor),@"product":@(e.product),@"name":spec?@(spec->name):@"Unknown",@"buttonCount":@(spec?spec->buttons.size():0),@"axes":axes,@"buttons":@(e.buttons),@"ledSupported":@(snapshot.ledSupported[i]),@"ledState":@(snapshot.ledState[i]),@"ledError":@(snapshot.ledError[i])}];
+        [items addObject:@{@"id":@(e.device),@"vendor":@(e.vendor),@"product":@(e.product),@"name":spec?@(spec->name):@"Unknown",@"buttonCount":@(spec?spec->buttons.size():0),@"axes":axes,@"buttons":@(e.buttons),@"ledSupported":@(snapshot.ledSupported[i]),@"ledState":@(snapshot.ledState[i]),@"ledError":@(snapshot.ledError[i]),
+            @"rezero":@(snapshot.rezero[i]),@"calibrating":@(snapshot.calibrating[i]),@"deviceCalibrated":@(snapshot.deviceCalibrated[i])}];
     }
     mach_task_basic_info_data_t memory{};mach_msg_type_number_t count=MACH_TASK_BASIC_INFO_COUNT;
     task_info(mach_task_self(),MACH_TASK_BASIC_INFO,reinterpret_cast<task_info_t>(&memory),&count);
@@ -420,6 +468,14 @@ NSDictionary* handle(NSDictionary* request) {
     if([op isEqual:@"requestAccessibility"]){
         bool trusted=AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{(__bridge NSString*)kAXTrustedCheckOptionPrompt:@YES});
         return @{@"trusted":@(trusted)};
+    }
+    if([op isEqual:@"calibrate"]){
+        id device=request[@"device"];
+        if(device&&(!number(device)||[device doubleValue]<1||[device doubleValue]>UINT32_MAX||std::floor([device doubleValue])!=[device doubleValue]))return @{@"error":@"device must be a device id"};
+        uint32_t target=device?[device unsignedIntValue]:0;
+        __block NSUInteger count=0;
+        dispatch_sync(inputQueue,^{for(auto& h:hidDevices)if(h.device&&h.rezero&&(!target||h.decoder.state.device==target)){calibrate(h);++count;}});
+        return @{@"calibrated":@(count)};
     }
     if([op isEqual:@"stop"]){dispatch_async(dispatch_get_main_queue(),^{kill(getpid(),SIGTERM);});return @{@"ok":@YES};}
     if([op isEqual:@"getConfig"])return document;
